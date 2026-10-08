@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pass Board</title>
+<style>
+:root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--muted:#6b6b70;--line:#e3e1dc;--accent:#2f6f5e;--accent-ink:#fff;--danger:#b3412f}
+@media (prefers-color-scheme:dark){:root{--bg:#141414;--card:#1e1e1f;--ink:#ececec;--muted:#9a9a9f;--line:#2e2e30;--accent:#6fbfa6;--accent-ink:#0f1f1a;--danger:#e07a68}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI","PingFang TC","Microsoft JhengHei",sans-serif}
+main{max-width:720px;margin:0 auto;padding:20px 16px 60px}
+header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:16px}
+h1{font-size:1.25rem;margin:0;letter-spacing:-.01em}
+#status{font-size:.8rem;color:var(--muted)}
+button{font:inherit;font-size:.9rem;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:8px 14px;cursor:pointer}
+button:hover{border-color:var(--muted)}
+button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
+button.danger{color:var(--danger)}
+button:disabled{opacity:.5;cursor:default}
+.panel{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+.panel p{margin:0 0 10px;font-size:.9rem;color:var(--muted)}
+input,textarea{width:100%;font:inherit;color:var(--ink);background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px 12px}
+textarea{min-height:120px;resize:vertical}
+input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
+.row{display:flex;gap:8px;justify-content:flex-end;align-items:center;margin-top:10px;flex-wrap:wrap}
+.hint{font-size:.8rem;color:var(--muted);margin-right:auto}
+.msg{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:10px}
+.msg .text{white-space:pre-wrap;word-break:break-word}
+.msg .meta{display:flex;align-items:center;gap:8px;margin-top:10px}
+.msg time{font-size:.8rem;color:var(--muted);margin-right:auto}
+.msg button{padding:6px 12px;font-size:.85rem}
+.empty{text-align:center;color:var(--muted);padding:30px 0}
+[hidden]{display:none!important}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div>
+      <h1>Pass Board</h1>
+      <div id="status">Not connected</div>
+    </div>
+    <div>
+      <button id="refreshBtn" hidden>Refresh</button>
+      <button id="settingsBtn" hidden>Settings</button>
+    </div>
+  </header>
+
+  <section id="setup" class="panel" hidden>
+    <p>Paste a GitHub token with only the <b>gist</b> scope. It's stored in this browser only. Do this once on each device.</p>
+    <input id="tokenInput" type="password" placeholder="ghp_…" autocomplete="off">
+    <div class="row">
+      <button id="disconnectBtn" class="danger" hidden>Disconnect this device</button>
+      <button id="saveTokenBtn" class="primary">Connect</button>
+    </div>
+  </section>
+
+  <section id="composer" class="panel" hidden>
+    <textarea id="input" placeholder="Paste or type something…"></textarea>
+    <div class="row">
+      <span class="hint">Ctrl/⌘ + Enter to post</span>
+      <button id="postBtn" class="primary">Post</button>
+    </div>
+  </section>
+
+  <section id="list"></section>
+</main>
+
+<script>
+const API = 'https://api.github.com';
+const DESC = 'pass-board-storage';
+const FILE = 'board.json';
+const MAX = 50;
+
+const $ = id => document.getElementById(id);
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set(k,v){ try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k,v); } catch(e){} }
+};
+
+let token = store.get('pb_token');
+let gistId = store.get('pb_gist');
+let messages = [];
+let busy = false;
+
+function status(t){ $('status').textContent = t; }
+
+async function gh(path, opts = {}) {
+  const headers = { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' };
+  if (opts.body) headers['Content-Type'] = 'application/json';
+  const r = await fetch(API + path, { ...opts, headers, cache: 'no-store' });
+  if (!r.ok) { const e = new Error(r.status + ' ' + (await r.text()).slice(0, 120)); e.status = r.status; throw e; }
+  return r.json();
+}
+
+async function findOrCreateGist() {
+  if (gistId) return;
+  for (let page = 1; page <= 5; page++) {
+    const list = await gh('/gists?per_page=100&page=' + page);
+    const g = list.find(x => x.description === DESC);
+    if (g) { gistId = g.id; store.set('pb_gist', gistId); return; }
+    if (list.length < 100) break;
+  }
+  const g = await gh('/gists', { method: 'POST', body: JSON.stringify({
+    description: DESC, public: false, files: { [FILE]: { content: '{"messages":[]}' } }
+  })});
+  gistId = g.id; store.set('pb_gist', gistId);
+}
+
+async function load() {
+  let g;
+  try { g = await gh('/gists/' + gistId); }
+  catch (e) {
+    if (e.status === 404) { gistId = null; store.set('pb_gist', null); await findOrCreateGist(); g = await gh('/gists/' + gistId); }
+    else throw e;
+  }
+  const f = g.files[FILE];
+  let content = f ? f.content : '{"messages":[]}';
+  if (f && f.truncated) content = await (await fetch(f.raw_url, { cache: 'no-store' })).text();
+  try { messages = JSON.parse(content).messages || []; } catch (e) { messages = []; }
+}
+
+async function save() {
+  await gh('/gists/' + gistId, { method: 'PATCH', body: JSON.stringify({
+    files: { [FILE]: { content: JSON.stringify({ messages }) } }
+  })});
+}
+
+function render() {
+  const list = $('list');
+  list.innerHTML = '';
+  if (!messages.length) {
+    const d = document.createElement('div'); d.className = 'empty'; d.textContent = 'Nothing here yet.';
+    list.appendChild(d); return;
+  }
+  for (const m of messages) {
+    const card = document.createElement('div'); card.className = 'msg';
+    const text = document.createElement('div'); text.className = 'text'; text.textContent = m.text;
+    const meta = document.createElement('div'); meta.className = 'meta';
+    const time = document.createElement('time'); time.textContent = new Date(m.ts).toLocaleString();
+    const copy = document.createElement('button'); copy.textContent = 'Copy';
+    copy.onclick = () => copyText(m.text, copy);
+    const del = document.createElement('button'); del.className = 'danger'; del.textContent = 'Delete';
+    del.onclick = () => remove(m.id);
+    meta.append(time, copy, del);
+    card.append(text, meta);
+    list.appendChild(card);
+  }
+}
+
+async function copyText(t, btn) {
+  try { await navigator.clipboard.writeText(t); }
+  catch (e) {
+    const ta = document.createElement('textarea'); ta.value = t; document.body.appendChild(ta);
+    ta.select(); document.execCommand('copy'); ta.remove();
+  }
+  const old = btn.textContent; btn.textContent = 'Copied'; setTimeout(() => btn.textContent = old, 1200);
+}
+
+async function run(label, fn) {
+  if (busy) return; busy = true; status(label);
+  try { await fn(); render(); status('Synced ' + new Date().toLocaleTimeString()); }
+  catch (e) {
+    status('Error: ' + e.message);
+    if (e.status === 401) showSetup(true);
+  }
+  finally { busy = false; }
+}
+
+function post() {
+  const text = $('input').value.trim();
+  if (!text) return;
+  run('Posting…', async () => {
+    await load();
+    messages.unshift({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), text, ts: Date.now() });
+    messages = messages.slice(0, MAX);
+    await save();
+    $('input').value = '';
+  });
+}
+
+function remove(id) {
+  run('Deleting…', async () => { await load(); messages = messages.filter(m => m.id !== id); await save(); });
+}
+
+function refresh() { run('Loading…', load); }
+
+function showSetup(show) {
+  $('setup').hidden = !show;
+  $('disconnectBtn').hidden = !token;
+}
+
+function connected() {
+  $('composer').hidden = false;
+  $('refreshBtn').hidden = false;
+  $('settingsBtn').hidden = false;
+  showSetup(false);
+}
+
+$('saveTokenBtn').onclick = () => {
+  const t = $('tokenInput').value.trim();
+  if (!t) return;
+  token = t; store.set('pb_token', t); $('tokenInput').value = '';
+  run('Connecting…', async () => { await findOrCreateGist(); await load(); connected(); });
+};
+$('disconnectBtn').onclick = () => {
+  token = null; gistId = null; store.set('pb_token', null); store.set('pb_gist', null);
+  messages = []; render(); $('composer').hidden = true; $('refreshBtn').hidden = true;
+  $('settingsBtn').hidden = true; showSetup(true); status('Not connected');
+};
+$('settingsBtn').onclick = () => showSetup($('setup').hidden);
+$('refreshBtn').onclick = refresh;
+$('postBtn').onclick = post;
+$('input').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) post(); });
+
+document.addEventListener('visibilitychange', () => { if (!document.hidden && token) refresh(); });
+setInterval(() => { if (!document.hidden && token && !busy) run('Loading…', load); }, 15000);
+
+if (token) run('Connecting…', async () => { await findOrCreateGist(); await load(); connected(); });
+else showSetup(true);
+</script>
+</body>
+</html>
