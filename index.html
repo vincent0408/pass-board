@@ -33,6 +33,15 @@ input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .msg time{font-size:.8rem;color:var(--muted);margin-right:auto}
 .msg button{padding:6px 12px;font-size:.85rem}
 .empty{text-align:center;color:var(--muted);padding:30px 0}
+.msg .text:empty{display:none}
+.msg img{display:block;max-width:100%;max-height:360px;margin:0 auto;border-radius:8px;cursor:zoom-in;background:var(--bg)}
+.msg img.full{max-height:none;cursor:zoom-out}
+.msg .text:not(:empty)+img{margin-top:10px}
+.msg .size{font-size:.75rem;color:var(--muted);margin-top:6px;text-align:center}
+#composer.drag{outline:2px dashed var(--accent);outline-offset:-2px}
+#preview{display:flex;align-items:center;gap:12px;margin-top:10px;padding:8px;border:1px solid var(--line);border-radius:8px}
+#preview img{width:64px;height:64px;object-fit:cover;border-radius:6px;flex-shrink:0;background:var(--bg)}
+#previewInfo{font-size:.8rem;color:var(--muted);margin-right:auto}
 [hidden]{display:none!important}
 </style>
 </head>
@@ -60,9 +69,16 @@ input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
   </section>
 
   <section id="composer" class="panel" hidden>
-    <textarea id="input" placeholder="Paste or type something…"></textarea>
+    <textarea id="input" placeholder="Paste or type something, or paste / drop an image…"></textarea>
+    <div id="preview" hidden>
+      <img id="previewImg" alt="">
+      <span id="previewInfo"></span>
+      <button id="clearImgBtn" type="button">Remove</button>
+    </div>
+    <input id="fileInput" type="file" accept="image/*" hidden>
     <div class="row">
       <span class="hint">Ctrl/⌘ + Enter to post</span>
+      <button id="imgBtn" type="button">Add image</button>
       <button id="postBtn" class="primary">Post</button>
     </div>
   </section>
@@ -76,6 +92,15 @@ const DESC = 'pass-board-storage';
 const FILE = 'board.json';
 const MAX = 50;
 
+// Images are stored as their own gist files (data URLs). GitHub returns up to
+// 1 MB per file inline, so each image is compressed to fit under that.
+const IMG_PREFIX = 'img-';
+const IMG_MAX_BYTES = 700 * 1024;        // ~950 KB once base64-encoded
+const IMG_MAX_INPUT = 25 * 1024 * 1024;  // refuse anything bigger before decoding
+const IMG_MAX_DIM = 2048;                // longest side after resizing
+const MAX_IMAGES = 10;                   // keep the newest image posts only
+const IMG_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
+
 const $ = id => document.getElementById(id);
 const store = {
   get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
@@ -85,16 +110,27 @@ const store = {
 let token = store.get('pb_token');
 let gistId = store.get('pb_gist');
 let messages = [];
+let images = {};        // gist file name -> data URL
+let gistFiles = [];     // file names currently in the gist
+let etag = null;        // lets polls skip the download when nothing changed
+let pending = null;     // image attached in the composer
 let busy = false;
 
 function status(t){ $('status').textContent = t; }
 
+function fmtBytes(n) {
+  return n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
+}
+
 async function gh(path, opts = {}) {
-  const headers = { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json' };
+  const headers = { 'Authorization': 'Bearer ' + token, 'Accept': 'application/vnd.github+json', ...(opts.headers || {}) };
   if (opts.body) headers['Content-Type'] = 'application/json';
   const r = await fetch(API + path, { ...opts, headers, cache: 'no-store' });
+  if (r.status === 304) return null;
   if (!r.ok) { const e = new Error(r.status + ' ' + (await r.text()).slice(0, 120)); e.status = r.status; throw e; }
-  return r.json();
+  const data = await r.json();
+  data._etag = r.headers.get('ETag');
+  return data;
 }
 
 async function findOrCreateGist() {
@@ -111,25 +147,157 @@ async function findOrCreateGist() {
   gistId = g.id; store.set('pb_gist', gistId);
 }
 
+async function fileContent(f) {
+  if (!f) return null;
+  if (!f.truncated) return f.content;
+  return (await fetch(f.raw_url, { cache: 'no-store' })).text();
+}
+
 async function load() {
   let g;
-  try { g = await gh('/gists/' + gistId); }
+  try { g = await gh('/gists/' + gistId, etag ? { headers: { 'If-None-Match': etag } } : {}); }
   catch (e) {
-    if (e.status === 404) { gistId = null; store.set('pb_gist', null); await findOrCreateGist(); g = await gh('/gists/' + gistId); }
+    if (!e.status && etag) { etag = null; return load(); }  // retry once without the conditional header
+    if (e.status === 404) { gistId = null; etag = null; store.set('pb_gist', null); await findOrCreateGist(); g = await gh('/gists/' + gistId); }
     else throw e;
   }
-  const f = g.files[FILE];
-  let content = f ? f.content : '{"messages":[]}';
-  if (f && f.truncated) content = await (await fetch(f.raw_url, { cache: 'no-store' })).text();
+  if (!g) return false;  // 304: unchanged since the last load
+  const content = (await fileContent(g.files[FILE])) || '{"messages":[]}';
   try { messages = JSON.parse(content).messages || []; } catch (e) { messages = []; }
+  gistFiles = Object.keys(g.files);
+  const next = {};
+  for (const name of gistFiles) {
+    if (!name.startsWith(IMG_PREFIX)) continue;
+    next[name] = images[name] || await fileContent(g.files[name]);  // file names are unique, so cached copies stay valid
+  }
+  images = next;
+  etag = g._etag;
 }
 
-async function save() {
-  await gh('/gists/' + gistId, { method: 'PATCH', body: JSON.stringify({
-    files: { [FILE]: { content: JSON.stringify({ messages }) } }
-  })});
+async function save(extraFiles = {}) {
+  const files = { [FILE]: { content: JSON.stringify({ messages }) }, ...extraFiles };
+  const used = new Set(messages.filter(m => m.img).map(m => m.img.file));
+  for (const name of gistFiles) {
+    if (name.startsWith(IMG_PREFIX) && !used.has(name) && !(name in files)) files[name] = null;  // delete orphaned images
+  }
+  const g = await gh('/gists/' + gistId, { method: 'PATCH', body: JSON.stringify({ files }) });
+  gistFiles = Object.keys(g.files);
+  for (const [name, f] of Object.entries(extraFiles)) if (f) images[name] = f.content;
+  etag = null;
 }
 
+/* ---------- Images ---------- */
+function safeImage(url) {
+  return typeof url === 'string' && /^data:image\/(png|jpeg|webp|gif);base64,/.test(url) ? url : null;
+}
+
+function readAsDataURL(blob) {
+  return new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(r.result); r.onerror = () => rej(r.error); r.readAsDataURL(blob); });
+}
+
+function decode(blob) {
+  return new Promise((res, rej) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); res(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error("Couldn't read that image.")); };
+    img.src = url;
+  });
+}
+
+function encode(img, scale, type, quality) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(img.naturalWidth * scale));
+  c.height = Math.max(1, Math.round(img.naturalHeight * scale));
+  const ctx = c.getContext('2d');
+  if (type === 'image/jpeg') { ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height); }  // JPEG has no transparency
+  ctx.drawImage(img, 0, 0, c.width, c.height);
+  return new Promise(res => c.toBlob(b => res(b && { blob: b, w: c.width, h: c.height }), type, quality));
+}
+
+// Checks the size and shrinks the image until it fits in one gist file.
+async function prepareImage(file) {
+  if (!file.type.startsWith('image/')) throw new Error('That file is not an image.');
+  if (file.size > IMG_MAX_INPUT) throw new Error(`Image is ${fmtBytes(file.size)}. The limit is ${fmtBytes(IMG_MAX_INPUT)}.`);
+  const img = await decode(file);
+  const w = img.naturalWidth, h = img.naturalHeight;
+  if (!w || !h) throw new Error("Couldn't read that image.");
+
+  if (IMG_TYPES.includes(file.type) && file.size <= IMG_MAX_BYTES && Math.max(w, h) <= IMG_MAX_DIM) {
+    return { dataUrl: await readAsDataURL(file), type: file.type, bytes: file.size, w, h, original: file.size };
+  }
+
+  // WebP keeps screenshots sharp and small; browsers that can't encode it fall back to JPEG.
+  const probe = await encode(img, Math.min(1, 64 / Math.max(w, h)), 'image/webp', 0.8);
+  const type = probe && probe.blob.type === 'image/webp' ? 'image/webp' : 'image/jpeg';
+  let scale = Math.min(1, IMG_MAX_DIM / Math.max(w, h));
+  for (let i = 0; i < 12; i++) {
+    for (const q of [0.85, 0.7, 0.55]) {
+      const out = await encode(img, scale, type, q);
+      if (out && out.blob.size <= IMG_MAX_BYTES) {
+        return { dataUrl: await readAsDataURL(out.blob), type, bytes: out.blob.size, w: out.w, h: out.h, original: file.size };
+      }
+    }
+    scale *= 0.75;
+  }
+  throw new Error("Couldn't shrink the image enough to post it.");
+}
+
+async function attach(file) {
+  if (!file) return;
+  status('Checking image…');
+  try {
+    pending = await prepareImage(file);
+    pending.name = (file.name || 'image').replace(/\.[^.]*$/, '').replace(/[^\w.-]+/g, '_').slice(0, 60) || 'image';
+    $('previewImg').src = pending.dataUrl;
+    $('previewInfo').textContent = `${pending.w}×${pending.h} · ${fmtBytes(pending.bytes)}` +
+      (pending.bytes < pending.original ? ` (was ${fmtBytes(pending.original)})` : '');
+    $('preview').hidden = false;
+    status('Image ready to post');
+  } catch (e) {
+    clearPending();
+    status('Error: ' + e.message);
+  }
+}
+
+function clearPending() {
+  pending = null;
+  $('preview').hidden = true;
+  $('previewImg').removeAttribute('src');
+  $('fileInput').value = '';
+}
+
+const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
+
+function downloadImage(m, url) {
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${m.img.name || 'pass-board'}.${EXT[m.img.type] || 'png'}`;
+  document.body.appendChild(a); a.click(); a.remove();
+}
+
+// Clipboards reliably accept only PNG, so other formats are converted first.
+async function toPng(url) {
+  const blob = await (await fetch(url)).blob();
+  if (blob.type === 'image/png') return blob;
+  const out = await encode(await decode(blob), 1, 'image/png');
+  if (!out) throw new Error('convert failed');
+  return out.blob;
+}
+
+async function copyImage(url, btn) {
+  let ok = false;
+  try {
+    if (!window.ClipboardItem || !navigator.clipboard?.write) throw new Error('unsupported');
+    // Passing a promise keeps Safari's user-gesture check happy while the PNG is prepared.
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': toPng(url) })]);
+    ok = true;
+  } catch (e) {}
+  flash(btn, ok ? 'Copied' : 'Copy failed');
+  if (!ok) status("This browser can't copy images. Use Download instead.");
+}
+
+/* ---------- Render ---------- */
 function render() {
   const list = $('list');
   list.innerHTML = '';
@@ -139,17 +307,49 @@ function render() {
   }
   for (const m of messages) {
     const card = document.createElement('div'); card.className = 'msg';
-    const text = document.createElement('div'); text.className = 'text'; text.textContent = m.text;
+    const text = document.createElement('div'); text.className = 'text'; text.textContent = m.text || '';
+    card.append(text);
     const meta = document.createElement('div'); meta.className = 'meta';
     const time = document.createElement('time'); time.textContent = new Date(m.ts).toLocaleString();
-    const copy = document.createElement('button'); copy.textContent = 'Copy';
-    copy.onclick = () => copyText(m.text, copy);
+    meta.append(time);
+
+    const url = m.img && safeImage(images[m.img.file]);
+    if (m.img) {
+      if (url) {
+        const img = document.createElement('img');
+        img.src = url; img.alt = m.img.name || 'Image'; img.loading = 'lazy';
+        img.onclick = () => img.classList.toggle('full');
+        const size = document.createElement('div'); size.className = 'size';
+        size.textContent = `${m.img.w}×${m.img.h} · ${fmtBytes(m.img.bytes)}`;
+        card.append(img, size);
+        const copyImg = document.createElement('button'); copyImg.textContent = 'Copy image';
+        copyImg.onclick = () => copyImage(url, copyImg);
+        const dl = document.createElement('button'); dl.textContent = 'Download';
+        dl.onclick = () => downloadImage(m, url);
+        meta.append(copyImg, dl);
+      } else {
+        const missing = document.createElement('div'); missing.className = 'size'; missing.textContent = 'Image unavailable';
+        card.append(missing);
+      }
+    }
+    if (m.text) {
+      const copy = document.createElement('button'); copy.textContent = m.img ? 'Copy text' : 'Copy';
+      copy.onclick = () => copyText(m.text, copy);
+      meta.append(copy);
+    }
     const del = document.createElement('button'); del.className = 'danger'; del.textContent = 'Delete';
     del.onclick = () => remove(m.id);
-    meta.append(time, copy, del);
-    card.append(text, meta);
+    meta.append(del);
+    card.append(meta);
     list.appendChild(card);
   }
+}
+
+function flash(btn, label) {
+  const old = btn.dataset.label || btn.textContent;
+  btn.dataset.label = old;
+  btn.textContent = label;
+  setTimeout(() => btn.textContent = old, 1200);
 }
 
 function fallbackCopy(t) {
@@ -171,21 +371,18 @@ async function copyText(t, btn) {
   let ok = false;
   try { await navigator.clipboard.writeText(t); ok = true; }
   catch (e) { ok = fallbackCopy(t); }
-  const old = btn.dataset.label || btn.textContent;
-  btn.dataset.label = old;
-  btn.textContent = ok ? 'Copied' : 'Copy failed';
-  setTimeout(() => btn.textContent = old, 1200);
+  flash(btn, ok ? 'Copied' : 'Copy failed');
 }
 
 function copyAll() {
-  if (!messages.length) return;
-  const all = messages.map(m => m.text).join('\n\n');
+  const all = messages.map(m => m.text).filter(Boolean).join('\n\n');
+  if (!all) return;
   copyText(all, $('copyAllBtn'));
 }
 
 async function run(label, fn) {
   if (busy) return; busy = true; status(label);
-  try { await fn(); render(); status('Synced ' + new Date().toLocaleTimeString()); }
+  try { if (await fn() !== false) render(); status('Synced ' + new Date().toLocaleTimeString()); }
   catch (e) {
     status('Error: ' + e.message);
     if (e.status === 401) showSetup(true);
@@ -193,15 +390,28 @@ async function run(label, fn) {
   finally { busy = false; }
 }
 
+function newId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
 function post() {
   const text = $('input').value.trim();
-  if (!text) return;
+  const image = pending;
+  if (!text && !image) return;
   run('Posting…', async () => {
     await load();
-    messages.unshift({ id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6), text, ts: Date.now() });
+    const m = { id: newId(), text, ts: Date.now() };
+    const extra = {};
+    if (image) {
+      const file = IMG_PREFIX + m.id + '.txt';
+      m.img = { file, type: image.type, bytes: image.bytes, w: image.w, h: image.h, name: image.name };
+      extra[file] = { content: image.dataUrl };
+    }
+    messages.unshift(m);
     messages = messages.slice(0, MAX);
-    await save();
+    let count = 0;
+    messages = messages.filter(x => !x.img || ++count <= MAX_IMAGES);  // drop the oldest image posts
+    await save(extra);
     $('input').value = '';
+    if (image === pending) clearPending();
   });
 }
 
@@ -231,15 +441,30 @@ $('saveTokenBtn').onclick = () => {
   run('Connecting…', async () => { await findOrCreateGist(); await load(); connected(); });
 };
 $('disconnectBtn').onclick = () => {
-  token = null; gistId = null; store.set('pb_token', null); store.set('pb_gist', null);
-  messages = []; render(); $('composer').hidden = true; $('refreshBtn').hidden = true; $('copyAllBtn').hidden = true;
+  token = null; gistId = null; etag = null; store.set('pb_token', null); store.set('pb_gist', null);
+  messages = []; images = {}; gistFiles = []; clearPending();
+  render(); $('composer').hidden = true; $('refreshBtn').hidden = true; $('copyAllBtn').hidden = true;
   $('settingsBtn').hidden = true; showSetup(true); status('Not connected');
 };
 $('settingsBtn').onclick = () => showSetup($('setup').hidden);
 $('refreshBtn').onclick = refresh;
 $('copyAllBtn').onclick = copyAll;
 $('postBtn').onclick = post;
+$('imgBtn').onclick = () => $('fileInput').click();
+$('fileInput').onchange = () => attach($('fileInput').files[0]);
+$('clearImgBtn').onclick = () => { clearPending(); status('Image removed'); };
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) post(); });
+$('input').addEventListener('paste', e => {
+  const file = [...(e.clipboardData?.files || [])].find(f => f.type.startsWith('image/'));
+  if (file) { e.preventDefault(); attach(file); }
+});
+const composer = $('composer');
+composer.addEventListener('dragover', e => { e.preventDefault(); composer.classList.add('drag'); });
+composer.addEventListener('dragleave', () => composer.classList.remove('drag'));
+composer.addEventListener('drop', e => {
+  e.preventDefault(); composer.classList.remove('drag');
+  attach([...(e.dataTransfer?.files || [])].find(f => f.type.startsWith('image/')));
+});
 
 document.addEventListener('visibilitychange', () => { if (!document.hidden && token) refresh(); });
 setInterval(() => { if (!document.hidden && token && !busy) run('Loading…', load); }, 15000);
