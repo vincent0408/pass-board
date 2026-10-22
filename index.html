@@ -17,6 +17,12 @@ header>div:last-child{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-e
 #status{font-size:.8rem;color:var(--muted)}
 button{font:inherit;font-size:.9rem;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:8px 14px;cursor:pointer}
 button:hover{border-color:var(--muted)}
+label.btn{display:inline-block;font-size:.9rem;border:1px solid var(--line);background:var(--card);color:var(--ink);border-radius:8px;padding:8px 14px;cursor:pointer;position:relative}
+label.btn:hover{border-color:var(--muted)}
+label.btn:focus-within{outline:2px solid var(--accent);outline-offset:1px}
+.vh{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0);pointer-events:none}
+#notice{margin-top:10px;padding:8px 12px;border-radius:8px;font-size:.85rem;background:var(--bg);border:1px solid var(--line)}
+#notice.error{color:var(--danger);border-color:var(--danger)}
 button.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
 button.danger{color:var(--danger)}
 button:disabled{opacity:.5;cursor:default}
@@ -27,6 +33,7 @@ textarea{min-height:120px;resize:vertical}
 input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
 .row{display:flex;gap:8px;justify-content:flex-end;align-items:center;margin-top:10px;flex-wrap:wrap}
 .hint{font-size:.8rem;color:var(--muted);margin-right:auto}
+@media (max-width:480px){.hint{display:none}}
 .msg{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px;margin-bottom:10px}
 .msg .text{white-space:pre-wrap;word-break:break-word}
 .msg .meta{display:flex;align-items:center;gap:8px;margin-top:10px}
@@ -81,12 +88,11 @@ input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
       <span id="previewInfo"></span>
       <button id="clearImgBtn" type="button">Remove</button>
     </div>
-    <input id="fileInput" type="file" accept="image/*" hidden>
-    <input id="anyFileInput" type="file" hidden>
+    <div id="notice" role="alert" hidden></div>
     <div class="row">
       <span class="hint">Ctrl/⌘ + Enter to post</span>
-      <button id="imgBtn" type="button">Add image</button>
-      <button id="fileBtn" type="button">Add file</button>
+      <label class="btn">Add image<input id="fileInput" class="vh" type="file" accept="image/*"></label>
+      <label class="btn">Add file<input id="anyFileInput" class="vh" type="file"></label>
       <button id="postBtn" class="primary">Post</button>
     </div>
   </section>
@@ -133,6 +139,15 @@ let pending = null;     // image or file attached in the composer
 let busy = false;
 
 function status(t){ $('status').textContent = t; }
+
+// Messages about the composer stay put until the next action, unlike the status line,
+// which background syncs overwrite every 15 seconds.
+function notice(t, isError) {
+  const n = $('notice');
+  n.hidden = !t;
+  n.textContent = t || '';
+  n.className = isError ? 'error' : '';
+}
 
 function fmtBytes(n) {
   return n < 1024 ? n + ' B' : n < 1048576 ? Math.round(n / 1024) + ' KB' : (n / 1048576).toFixed(1) + ' MB';
@@ -272,9 +287,17 @@ async function prepareImage(file) {
 
 async function attach(file) {
   if (!file) return;
-  status('Checking image…');
+  if (!file.type.startsWith('image/') || file.type === 'image/svg+xml') return attachFile(file);
+  notice('Checking image…');
   try {
-    pending = await prepareImage(file);
+    try { pending = await prepareImage(file); }
+    catch (e) {
+      if (!/read that image/.test(e.message)) throw e;
+      // e.g. HEIC on a browser that can't display it: keep the original as a file instead
+      await attachFile(file);
+      if (pending) notice("This browser can't show that image, so it will be posted as a file.");
+      return;
+    }
     pending.kind = 'image';
     pending.name = (file.name || 'image').replace(/\.[^.]*$/, '').replace(/[^\w.-]+/g, '_').slice(0, 60) || 'image';
     $('previewImg').src = pending.dataUrl;
@@ -283,10 +306,10 @@ async function attach(file) {
     $('previewInfo').textContent = `${pending.w}×${pending.h} · ${fmtBytes(pending.bytes)}` +
       (pending.bytes < pending.original ? ` (was ${fmtBytes(pending.original)})` : '');
     $('preview').hidden = false;
-    status('Image ready to post');
+    notice(null);
   } catch (e) {
     clearPending();
-    status('Error: ' + e.message);
+    notice(e.message, true);
   }
 }
 
@@ -308,7 +331,7 @@ async function attachFile(file) {
   try {
     if (!file.size) throw new Error('That file is empty.');
     if (file.size > FILE_MAX_BYTES) throw new Error(`File is over the ${FILE_MAX_BYTES / 1048576} MB limit (${(file.size / 1048576).toFixed(2)} MB).`);
-    status('Reading file…');
+    notice('Reading file…');
     const dataUrl = await readAsDataURL(file);
     pending = { kind: 'file', name: safeFileName(file.name), type: file.type || 'application/octet-stream',
                 bytes: file.size, b64: dataUrl.slice(dataUrl.indexOf(',') + 1) };
@@ -317,10 +340,10 @@ async function attachFile(file) {
     $('previewIcon').hidden = false;
     $('previewInfo').textContent = `${pending.name} · ${fmtBytes(pending.bytes)}`;
     $('preview').hidden = false;
-    status('File ready to post');
+    notice(null);
   } catch (e) {
     clearPending();
-    status('Error: ' + e.message);
+    notice(e.message, true);
   }
 }
 
@@ -354,7 +377,7 @@ async function downloadFile(m, btn) {
     flash(btn, 'Downloaded');
   } catch (e) {
     flash(btn, 'Download failed');
-    status("Couldn't download that file. Refresh and try again.");
+    notice("Couldn't download that file. Refresh and try again.", true);
   }
 }
 
@@ -385,7 +408,7 @@ async function copyImage(url, btn) {
     ok = true;
   } catch (e) {}
   flash(btn, ok ? 'Copied' : 'Copy failed');
-  if (!ok) status("This browser can't copy images. Use Download instead.");
+  if (!ok) notice("This browser can't copy images. Use Download instead.", true);
 }
 
 /* ---------- Render ---------- */
@@ -484,14 +507,24 @@ function copyAll() {
   copyText(all, $('copyAllBtn'));
 }
 
-async function run(label, fn) {
-  if (busy) return; busy = true; status(label);
-  try { if (await fn() !== false) render(); status('Synced ' + new Date().toLocaleTimeString()); }
-  catch (e) {
-    status('Error: ' + e.message);
-    if (e.status === 401) showSetup(true);
-  }
-  finally { busy = false; }
+let queue = Promise.resolve();
+
+// User actions wait their turn; background syncs are skipped while anything runs.
+function run(label, fn, background = false) {
+  if (background && busy) return Promise.resolve(false);
+  const job = queue.then(async () => {
+    busy = true; status(label);
+    try { if (await fn() !== false) render(); status('Synced ' + new Date().toLocaleTimeString()); return true; }
+    catch (e) {
+      status('Error: ' + e.message);
+      if (!background) notice(e.message, true);
+      if (e.status === 401) showSetup(true);
+      return false;
+    }
+    finally { busy = false; }
+  });
+  queue = job;
+  return job;
 }
 
 function newId() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
@@ -499,7 +532,9 @@ function newId() { return Date.now().toString(36) + Math.random().toString(36).s
 function post() {
   const text = $('input').value.trim();
   const attached = pending;
-  if (!text && !attached) return;
+  if (!text && !attached || $('postBtn').disabled) return;
+  $('postBtn').disabled = true;
+  if (attached) notice(`Uploading ${attached.name} (${fmtBytes(attached.bytes)})…`);
   run('Posting…', async () => {
     await load();
     const m = { id: newId(), text, ts: Date.now() };
@@ -527,7 +562,8 @@ function post() {
     await save(extra);
     $('input').value = '';
     if (attached === pending) clearPending();
-  });
+    notice(null);
+  }).finally(() => { $('postBtn').disabled = false; });
 }
 
 function remove(id) {
@@ -565,11 +601,9 @@ $('settingsBtn').onclick = () => showSetup($('setup').hidden);
 $('refreshBtn').onclick = refresh;
 $('copyAllBtn').onclick = copyAll;
 $('postBtn').onclick = post;
-$('imgBtn').onclick = () => $('fileInput').click();
-$('fileInput').onchange = () => attach($('fileInput').files[0]);
-$('fileBtn').onclick = () => $('anyFileInput').click();
-$('anyFileInput').onchange = () => attachFile($('anyFileInput').files[0]);
-$('clearImgBtn').onclick = () => { clearPending(); status('Image removed'); };
+$('fileInput').onchange = () => { const f = $('fileInput').files[0]; $('fileInput').value = ''; attach(f); };
+$('anyFileInput').onchange = () => { const f = $('anyFileInput').files[0]; $('anyFileInput').value = ''; attachFile(f); };
+$('clearImgBtn').onclick = () => { clearPending(); notice(null); };
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) post(); });
 $('input').addEventListener('paste', e => {
   const file = (e.clipboardData?.files || [])[0];
@@ -583,8 +617,8 @@ composer.addEventListener('drop', e => {
   attachAny((e.dataTransfer?.files || [])[0]);
 });
 
-document.addEventListener('visibilitychange', () => { if (!document.hidden && token) refresh(); });
-setInterval(() => { if (!document.hidden && token && !busy) run('Loading…', load); }, 15000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden && token) run('Loading…', load, true); });
+setInterval(() => { if (!document.hidden && token) run('Loading…', load, true); }, 15000);
 
 if (token) run('Connecting…', async () => { await findOrCreateGist(); await load(); connected(); });
 else showSetup(true);
