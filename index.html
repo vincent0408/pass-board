@@ -41,7 +41,12 @@ input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
 #composer.drag{outline:2px dashed var(--accent);outline-offset:-2px}
 #preview{display:flex;align-items:center;gap:12px;margin-top:10px;padding:8px;border:1px solid var(--line);border-radius:8px}
 #preview img{width:64px;height:64px;object-fit:cover;border-radius:6px;flex-shrink:0;background:var(--bg)}
-#previewInfo{font-size:.8rem;color:var(--muted);margin-right:auto}
+#previewInfo{font-size:.8rem;color:var(--muted);margin-right:auto;word-break:break-all}
+.msg .file{display:flex;align-items:center;gap:10px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg)}
+.msg .text:not(:empty)+.file{margin-top:10px}
+.msg .file .name{font-weight:600;word-break:break-all}
+.msg .file .size{margin:0;text-align:left}
+.fileicon{font-size:1.5rem;line-height:1}
 [hidden]{display:none!important}
 </style>
 </head>
@@ -69,16 +74,19 @@ input:focus,textarea:focus{outline:2px solid var(--accent);outline-offset:-1px}
   </section>
 
   <section id="composer" class="panel" hidden>
-    <textarea id="input" placeholder="Paste or type something, or paste / drop an image…"></textarea>
+    <textarea id="input" placeholder="Paste or type something, or paste / drop an image or file…"></textarea>
     <div id="preview" hidden>
       <img id="previewImg" alt="">
+      <span id="previewIcon" class="fileicon" hidden>📄</span>
       <span id="previewInfo"></span>
       <button id="clearImgBtn" type="button">Remove</button>
     </div>
     <input id="fileInput" type="file" accept="image/*" hidden>
+    <input id="anyFileInput" type="file" hidden>
     <div class="row">
       <span class="hint">Ctrl/⌘ + Enter to post</span>
       <button id="imgBtn" type="button">Add image</button>
+      <button id="fileBtn" type="button">Add file</button>
       <button id="postBtn" class="primary">Post</button>
     </div>
   </section>
@@ -101,6 +109,13 @@ const IMG_MAX_DIM = 2048;                // longest side after resizing
 const MAX_IMAGES = 10;                   // keep the newest image posts only
 const IMG_TYPES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif'];
 
+// Other files are stored unchanged as base64, split into parts that each stay
+// under GitHub's 1 MB inline limit.
+const FILE_PREFIX = 'file-';
+const FILE_MAX_BYTES = 5 * 1024 * 1024;
+const PART_CHARS = 900 * 1024;
+const MAX_FILES = 5;                     // keep the newest file posts only
+
 const $ = id => document.getElementById(id);
 const store = {
   get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
@@ -111,9 +126,10 @@ let token = store.get('pb_token');
 let gistId = store.get('pb_gist');
 let messages = [];
 let images = {};        // gist file name -> data URL
+let parts = {};         // gist file name -> base64 text, or { raw } to fetch on download
 let gistFiles = [];     // file names currently in the gist
 let etag = null;        // lets polls skip the download when nothing changed
-let pending = null;     // image attached in the composer
+let pending = null;     // image or file attached in the composer
 let busy = false;
 
 function status(t){ $('status').textContent = t; }
@@ -165,24 +181,35 @@ async function load() {
   const content = (await fileContent(g.files[FILE])) || '{"messages":[]}';
   try { messages = JSON.parse(content).messages || []; } catch (e) { messages = []; }
   gistFiles = Object.keys(g.files);
-  const next = {};
+  const next = {}, nextParts = {};
   for (const name of gistFiles) {
-    if (!name.startsWith(IMG_PREFIX)) continue;
-    next[name] = images[name] || await fileContent(g.files[name]);  // file names are unique, so cached copies stay valid
+    const f = g.files[name];
+    // file names are unique, so cached copies stay valid
+    if (name.startsWith(IMG_PREFIX)) next[name] = images[name] || await fileContent(f);
+    else if (name.startsWith(FILE_PREFIX)) nextParts[name] = parts[name] || (f.truncated ? { raw: f.raw_url } : f.content);
   }
   images = next;
+  parts = nextParts;
   etag = g._etag;
 }
 
 async function save(extraFiles = {}) {
   const files = { [FILE]: { content: JSON.stringify({ messages }) }, ...extraFiles };
-  const used = new Set(messages.filter(m => m.img).map(m => m.img.file));
+  const used = new Set();
+  for (const m of messages) {
+    if (m.img) used.add(m.img.file);
+    if (m.file) m.file.parts.forEach(n => used.add(n));
+  }
   for (const name of gistFiles) {
-    if (name.startsWith(IMG_PREFIX) && !used.has(name) && !(name in files)) files[name] = null;  // delete orphaned images
+    const attachment = name.startsWith(IMG_PREFIX) || name.startsWith(FILE_PREFIX);
+    if (attachment && !used.has(name) && !(name in files)) files[name] = null;  // delete orphaned attachments
   }
   const g = await gh('/gists/' + gistId, { method: 'PATCH', body: JSON.stringify({ files }) });
   gistFiles = Object.keys(g.files);
-  for (const [name, f] of Object.entries(extraFiles)) if (f) images[name] = f.content;
+  for (const [name, f] of Object.entries(extraFiles)) {
+    if (f && name.startsWith(IMG_PREFIX)) images[name] = f.content;
+    if (f && name.startsWith(FILE_PREFIX)) parts[name] = f.content;
+  }
   etag = null;
 }
 
@@ -218,7 +245,7 @@ function encode(img, scale, type, quality) {
 // Checks the size and shrinks the image until it fits in one gist file.
 async function prepareImage(file) {
   if (!file.type.startsWith('image/')) throw new Error('That file is not an image.');
-  if (file.size > IMG_MAX_INPUT) throw new Error(`Image is ${fmtBytes(file.size)}. The limit is ${fmtBytes(IMG_MAX_INPUT)}.`);
+  if (file.size > IMG_MAX_INPUT) throw new Error(`Image is over the ${IMG_MAX_INPUT / 1048576} MB limit (${(file.size / 1048576).toFixed(2)} MB).`);
   const img = await decode(file);
   const w = img.naturalWidth, h = img.naturalHeight;
   if (!w || !h) throw new Error("Couldn't read that image.");
@@ -248,8 +275,11 @@ async function attach(file) {
   status('Checking image…');
   try {
     pending = await prepareImage(file);
+    pending.kind = 'image';
     pending.name = (file.name || 'image').replace(/\.[^.]*$/, '').replace(/[^\w.-]+/g, '_').slice(0, 60) || 'image';
     $('previewImg').src = pending.dataUrl;
+    $('previewImg').hidden = false;
+    $('previewIcon').hidden = true;
     $('previewInfo').textContent = `${pending.w}×${pending.h} · ${fmtBytes(pending.bytes)}` +
       (pending.bytes < pending.original ? ` (was ${fmtBytes(pending.original)})` : '');
     $('preview').hidden = false;
@@ -265,6 +295,67 @@ function clearPending() {
   $('preview').hidden = true;
   $('previewImg').removeAttribute('src');
   $('fileInput').value = '';
+  $('anyFileInput').value = '';
+}
+
+/* ---------- Files ---------- */
+function safeFileName(name) {
+  return (name || 'file').replace(/[\\/:*?"<>|\u0000-\u001f]+/g, '_').slice(-120) || 'file';
+}
+
+async function attachFile(file) {
+  if (!file) return;
+  try {
+    if (!file.size) throw new Error('That file is empty.');
+    if (file.size > FILE_MAX_BYTES) throw new Error(`File is over the ${FILE_MAX_BYTES / 1048576} MB limit (${(file.size / 1048576).toFixed(2)} MB).`);
+    status('Reading file…');
+    const dataUrl = await readAsDataURL(file);
+    pending = { kind: 'file', name: safeFileName(file.name), type: file.type || 'application/octet-stream',
+                bytes: file.size, b64: dataUrl.slice(dataUrl.indexOf(',') + 1) };
+    $('previewImg').hidden = true;
+    $('previewImg').removeAttribute('src');
+    $('previewIcon').hidden = false;
+    $('previewInfo').textContent = `${pending.name} · ${fmtBytes(pending.bytes)}`;
+    $('preview').hidden = false;
+    status('File ready to post');
+  } catch (e) {
+    clearPending();
+    status('Error: ' + e.message);
+  }
+}
+
+// Pasted or dropped images become image posts; anything else is sent as a file.
+function attachAny(file) {
+  if (!file) return;
+  if (file.type.startsWith('image/') && file.type !== 'image/svg+xml') attach(file);
+  else attachFile(file);
+}
+
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function downloadFile(m, btn) {
+  flash(btn, 'Preparing…');
+  try {
+    let b64 = '';
+    for (const name of m.file.parts) {
+      let v = parts[name];
+      if (v == null) throw new Error('missing part');
+      if (typeof v === 'object') v = parts[name] = await (await fetch(v.raw, { cache: 'no-store' })).text();
+      b64 += v;
+    }
+    const blob = await (await fetch('data:application/octet-stream;base64,' + b64)).blob();
+    saveBlob(new Blob([blob], { type: m.file.type || 'application/octet-stream' }), safeFileName(m.file.name));
+    flash(btn, 'Downloaded');
+  } catch (e) {
+    flash(btn, 'Download failed');
+    status("Couldn't download that file. Refresh and try again.");
+  }
 }
 
 const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/webp': 'webp', 'image/gif': 'gif' };
@@ -332,8 +423,21 @@ function render() {
         card.append(missing);
       }
     }
+    if (m.file) {
+      const box = document.createElement('div'); box.className = 'file';
+      const icon = document.createElement('span'); icon.className = 'fileicon'; icon.textContent = '📄';
+      const info = document.createElement('div');
+      const name = document.createElement('div'); name.className = 'name'; name.textContent = m.file.name;
+      const size = document.createElement('div'); size.className = 'size'; size.textContent = fmtBytes(m.file.bytes);
+      info.append(name, size);
+      box.append(icon, info);
+      card.append(box);
+      const dl = document.createElement('button'); dl.textContent = 'Download';
+      dl.onclick = () => downloadFile(m, dl);
+      meta.append(dl);
+    }
     if (m.text) {
-      const copy = document.createElement('button'); copy.textContent = m.img ? 'Copy text' : 'Copy';
+      const copy = document.createElement('button'); copy.textContent = m.img || m.file ? 'Copy text' : 'Copy';
       copy.onclick = () => copyText(m.text, copy);
       meta.append(copy);
     }
@@ -394,24 +498,35 @@ function newId() { return Date.now().toString(36) + Math.random().toString(36).s
 
 function post() {
   const text = $('input').value.trim();
-  const image = pending;
-  if (!text && !image) return;
+  const attached = pending;
+  if (!text && !attached) return;
   run('Posting…', async () => {
     await load();
     const m = { id: newId(), text, ts: Date.now() };
     const extra = {};
-    if (image) {
+    if (attached && attached.kind === 'image') {
       const file = IMG_PREFIX + m.id + '.txt';
-      m.img = { file, type: image.type, bytes: image.bytes, w: image.w, h: image.h, name: image.name };
-      extra[file] = { content: image.dataUrl };
+      m.img = { file, type: attached.type, bytes: attached.bytes, w: attached.w, h: attached.h, name: attached.name };
+      extra[file] = { content: attached.dataUrl };
+    }
+    if (attached && attached.kind === 'file') {
+      const names = [];
+      for (let i = 0; i * PART_CHARS < attached.b64.length; i++) {
+        const name = `${FILE_PREFIX}${m.id}-${i}.txt`;
+        names.push(name);
+        extra[name] = { content: attached.b64.slice(i * PART_CHARS, (i + 1) * PART_CHARS) };
+      }
+      m.file = { name: attached.name, type: attached.type, bytes: attached.bytes, parts: names };
     }
     messages.unshift(m);
     messages = messages.slice(0, MAX);
     let count = 0;
     messages = messages.filter(x => !x.img || ++count <= MAX_IMAGES);  // drop the oldest image posts
+    let fileCount = 0;
+    messages = messages.filter(x => !x.file || ++fileCount <= MAX_FILES);  // and the oldest file posts
     await save(extra);
     $('input').value = '';
-    if (image === pending) clearPending();
+    if (attached === pending) clearPending();
   });
 }
 
@@ -442,7 +557,7 @@ $('saveTokenBtn').onclick = () => {
 };
 $('disconnectBtn').onclick = () => {
   token = null; gistId = null; etag = null; store.set('pb_token', null); store.set('pb_gist', null);
-  messages = []; images = {}; gistFiles = []; clearPending();
+  messages = []; images = {}; parts = {}; gistFiles = []; clearPending();
   render(); $('composer').hidden = true; $('refreshBtn').hidden = true; $('copyAllBtn').hidden = true;
   $('settingsBtn').hidden = true; showSetup(true); status('Not connected');
 };
@@ -452,18 +567,20 @@ $('copyAllBtn').onclick = copyAll;
 $('postBtn').onclick = post;
 $('imgBtn').onclick = () => $('fileInput').click();
 $('fileInput').onchange = () => attach($('fileInput').files[0]);
+$('fileBtn').onclick = () => $('anyFileInput').click();
+$('anyFileInput').onchange = () => attachFile($('anyFileInput').files[0]);
 $('clearImgBtn').onclick = () => { clearPending(); status('Image removed'); };
 $('input').addEventListener('keydown', e => { if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) post(); });
 $('input').addEventListener('paste', e => {
-  const file = [...(e.clipboardData?.files || [])].find(f => f.type.startsWith('image/'));
-  if (file) { e.preventDefault(); attach(file); }
+  const file = (e.clipboardData?.files || [])[0];
+  if (file) { e.preventDefault(); attachAny(file); }
 });
 const composer = $('composer');
 composer.addEventListener('dragover', e => { e.preventDefault(); composer.classList.add('drag'); });
 composer.addEventListener('dragleave', () => composer.classList.remove('drag'));
 composer.addEventListener('drop', e => {
   e.preventDefault(); composer.classList.remove('drag');
-  attach([...(e.dataTransfer?.files || [])].find(f => f.type.startsWith('image/')));
+  attachAny((e.dataTransfer?.files || [])[0]);
 });
 
 document.addEventListener('visibilitychange', () => { if (!document.hidden && token) refresh(); });
